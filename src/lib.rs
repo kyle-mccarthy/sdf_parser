@@ -1,14 +1,10 @@
 use nom::{
-    branch::alt,
-    bytes::complete::{is_a, is_not, tag, take, take_until, take_while},
-    character::{
-        complete::{digit1, line_ending, space0},
-        is_space,
-    },
-    combinator::{cut, eof, map_parser, map_res},
-    multi::{many1, separated_list0},
+    bytes::complete::{is_a, is_not, tag, take, take_until},
+    character::complete::{digit1, line_ending, multispace0, space0},
+    combinator::{eof, map, map_parser, map_res},
+    multi::{many0, many1, separated_list0, separated_list1},
     number::complete::float,
-    sequence::{pair, preceded, tuple},
+    sequence::{delimited, pair, preceded, terminated, tuple},
     IResult,
 };
 
@@ -30,7 +26,7 @@ impl Into<nom::Err<Error>> for Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Header<'a> {
     pub title_line: &'a str,
     pub initials: &'a str,
@@ -40,8 +36,7 @@ pub struct Header<'a> {
 }
 //   9  8  0     0  0  0  0  0  0999 V2000
 // ___---___---___---___---___---___------
-#[derive(Debug)]
-#[repr(C)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Counts<'a> {
     pub num_atoms: u16,
     pub num_bonds: u16,
@@ -50,7 +45,7 @@ pub struct Counts<'a> {
 }
 
 /// # Atoms Line
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Atom<'a> {
     pub x: f32,
     pub y: f32,
@@ -73,6 +68,7 @@ pub struct Atom<'a> {
     pub obsolete: &'a [u8],
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Bond<'a> {
     pub from: u16,
     pub to: u16,
@@ -98,14 +94,22 @@ pub struct Bond<'a> {
     pub obsolete: &'a [u8],
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Property<'a> {
     pub property: &'a str,
     pub num_values: u16,
     pub values: Vec<(u16, i16)>,
 }
 
-pub struct SDF {}
+#[derive(Debug, PartialEq)]
+pub struct Record<'a> {
+    pub header: Header<'a>,
+    pub counts: Counts<'a>,
+    pub atoms: Vec<Atom<'a>>,
+    pub bonds: Vec<Bond<'a>>,
+    pub properties: Vec<Property<'a>>,
+    pub data: Vec<(&'a str, Vec<&'a str>)>,
+}
 
 pub trait FromStrRadix: Sized {
     fn from_str_radix(s: &str, radix: u32) -> Result<Self>;
@@ -151,27 +155,37 @@ pub fn take_line(bytes: &[u8]) -> IResult<&[u8], &[u8]> {
     Ok((i, o))
 }
 
+/// Transforms the byte string to a base 10 integer
 pub fn bytes_to_int<T: FromStrRadix>(bytes: &[u8]) -> Result<T> {
     let out = T::from_str_radix(std::str::from_utf8(&bytes)?, 10)?;
     Ok(out)
 }
 
+/// Transforms the byte string to a float
 pub fn bytes_to_float(bytes: &[u8]) -> Result<f32> {
     use std::str::FromStr;
     let out = f32::from_str(std::str::from_utf8(&bytes)?)?;
     Ok(out)
 }
 
+/// Parse an unsigned integer <T> from a byte string padded with zero or more
+/// spaces
 pub fn parse_padded_int<T: FromStrRadix>(bytes: &[u8]) -> IResult<&[u8], T> {
     map_res(preceded(space0, digit1), bytes_to_int::<T>)(bytes)
 }
 
+/// Parse a signed integer <T> from a byte string padded with zero or more
+/// spaces
+pub fn parse_padded_signed_int<T: FromStrRadix>(bytes: &[u8]) -> IResult<&[u8], T> {
+    map_res(preceded(space0, is_a("-0123456789")), bytes_to_int::<T>)(bytes)
+}
+
+/// Parse a float from a byte string padded with zero or more spaces
 pub fn parse_padded_float(bytes: &[u8]) -> IResult<&[u8], f32> {
     map_parser(preceded(space0, is_a("1234567890.-")), float)(bytes)
 }
 
 pub fn parse_counts_line(bytes: &[u8]) -> IResult<&[u8], Counts> {
-    // Ok()(num_atoms, num_atoms, obsolete, version)
     let (rest, (num_atoms, num_bonds, obsolete, version, _)) = tuple((
         map_parser(take(3usize), parse_padded_int),
         map_parser(take(3usize), parse_padded_int),
@@ -286,7 +300,7 @@ pub fn parse_property_line(bytes: &[u8]) -> IResult<&[u8], Property> {
     // "M**ISO**1***1***2" -> (M  ISO, 1, [(1, 2)])
     let parse_pair = pair(
         map_parser(take(4usize), parse_padded_int::<u16>),
-        map_parser(take(4usize), parse_padded_int::<i16>),
+        map_parser(take(4usize), parse_padded_signed_int::<i16>),
     );
 
     let num_pairs = map_parser(take(3usize), parse_padded_int::<u16>);
@@ -310,19 +324,36 @@ pub fn parse_property_line(bytes: &[u8]) -> IResult<&[u8], Property> {
 pub fn parse_property_block(bytes: &[u8]) -> IResult<&[u8], (Vec<Property>, &[u8])> {
     tuple((
         separated_list0(line_ending, parse_property_line),
-        tag("M END"),
+        preceded(multispace0, tag("M  END\n")),
     ))(bytes)
 }
 
-pub fn parse_record(bytes: &[u8]) -> IResult<&[u8], &[u8]> {
-    use std::str::FromStr;
+pub fn parse_data_item_name(bytes: &[u8]) -> IResult<&[u8], &str> {
+    map_res(delimited(tag("> <"), is_not(">"), tag(">")), |name| {
+        std::str::from_utf8(name)
+    })(bytes)
+}
 
-    use nom::{dbg_basic, named};
+pub fn parse_data_item(bytes: &[u8]) -> IResult<&[u8], (&str, Vec<&str>)> {
+    map(
+        tuple((
+            parse_data_item_name,
+            line_ending,
+            map_parser(
+                terminated(take_until("\n\n"), tag("\n\n")),
+                separated_list1(line_ending, map_res(is_not("\n"), std::str::from_utf8)),
+            ),
+        )),
+        |(name, _, values)| (name, values),
+    )(bytes)
+}
 
-    // fn is_period(chr: u8) -> bool {}
+pub fn parse_data_items_block(bytes: &[u8]) -> IResult<&[u8], Vec<(&str, Vec<&str>)>> {
+    many0(parse_data_item)(bytes)
+}
 
-    let (rest, header) = take_until("$$$$")(bytes)?;
-    let (rest, _) = take(4usize)(rest)?;
+pub fn parse_record(bytes: &[u8]) -> IResult<&[u8], Record> {
+    let (rest, header) = terminated(take_until("$$$$"), tuple((tag("$$$$"), multispace0)))(bytes)?;
 
     let (record, header) = parse_header(header)?;
     let (record, line) = take_line(record)?;
@@ -348,29 +379,19 @@ pub fn parse_record(bytes: &[u8]) -> IResult<&[u8], &[u8]> {
         bonds.push(bond);
     }
 
-    // for _ in 0..counts.num_bonds {
-    //     let (_, line) = take_line(record)?;
-    // }
+    let (record, (properties, _)) = parse_property_block(record)?;
 
-    // dbg!(atom);
+    let (_, (data, _)) = tuple((parse_data_items_block, eof))(record)?;
 
-    // let out: IResult<&[u8], &[u8]> = cut(alt((digit1, is_a("."))))(b"   1234");
-    // let out: IResult<&[u8], f32> =
-    //     map_parser(preceded(space0, alt((digit1, is_a(" ")))), float)(b"
-    // 1234");
-
-    // let (rest, f) = nom::number::complete::float(out)?;
-
-    // dbg!(f);
-
-    // *****************************************************
-    // THIS IS REALLY COOL !!!
-    // let out = map_res(
-    //     nom::sequence::pair(is_a(" "), nom::combinator::rest),
-    //     |(_, data)| bytes_to_float(data),
-    // )(out)?;
-    // dbg!(out);
-    Ok((rest, &[]))
+    let record = Record {
+        header,
+        counts,
+        atoms,
+        bonds,
+        properties,
+        data,
+    };
+    Ok((rest, record))
 }
 
 // pub fn parse_counts(slice: &[u8]) -> IResult<&[u8], (&str, &str, &[u8],
@@ -380,47 +401,8 @@ pub fn parse_record(bytes: &[u8]) -> IResult<&[u8], &[u8]> {
 //     // tuple((take(3usize), take(3usize), take(33usize), rest))(slice)
 // }
 
-pub unsafe fn parse_records(bytes: &[u8]) -> Result<()> {
-    // let end_record = tag("$$$$");
-    // let cut_records = cut(is_not("$$$$"));
-    // let out: IResult<&[u8], Vec<&[u8]>> =
-    //     nom::multi::many0(nom::bytes::complete::is_not("$$$$"))(bytes);
-    // let out = out.unwrap();
-    // dbg!(out.1.len());
-    // let out: IResult<&[u8], (&[u8], &[u8])> = (())
-    // let mut parser: IResult<(&[u8],)> = delimited(is_not("$$$$"), tag("$$$$"),
-    // rest);
-    // let out: IResult<&[u8], &[u8]> = nom::sequence::preceded(tag("$$$$"),
-    // rest)(bytes); let out = out.unwrap();
-
-    // // dbg!(out);
-    // unsafe {
-    //     dbg!(std::str::from_utf8_unchecked(&out.0));
-    //     dbg!(std::str::from_utf8_unchecked(&out.1));
-    // }
-
-    // let out: IResult<&[u8], &[u8]> = nom::sequence::terminated(is_not("$$$$"),
-    // tag("$$$$"))(bytes);
-
-    // use nom::take_until;
-
-    // nom::named!(take_record, take_until!("$$$$"));
-    // nom::named!(take_line, take_until!)
-
-    // let out: IResult<&[u8], &[u8]> = take_record(bytes);
-    // let (i, record) = out.unwrap();
-
-    // let (rest, title_line): (&[u8], &[u8]) = take_line(record).unwrap();
-    // let (rest, program_line): (&[u8], &[u8]) = take_line(rest).unwrap();
-    // let (rest, comment_line): (&[u8], &[u8]) = take_line(rest).unwrap();
-    // let (rest, count_line): (&[u8], &[u8]) = take_line(rest).unwrap();
-
-    // let (rest, (num_atoms, num_bonds, obsolete, version)) =
-    // parse_count_line(count_line).unwrap();
-
-    // dbg!((num_atoms, num_bonds, version));
-    parse_record(&bytes).unwrap();
-    Ok(())
+pub fn parse_records(bytes: &[u8]) -> IResult<&[u8], Vec<Record>> {
+    many1(parse_record)(bytes)
 
     // let test_str: &[u8] = b"123\n456";
 
@@ -433,35 +415,117 @@ pub unsafe fn parse_records(bytes: &[u8]) -> Result<()> {
     // dbg!(consumed_til_new_line);
 }
 
-pub fn testing() {
-    let bytes: &'static [u8] = include_bytes!("../assets/sample.sdf");
-
-    unsafe {
-        // parse_records(b"abc\n123$$$$xyz\n456$$$$rsv\n999$$$$");
-        let res = parse_records(bytes);
-        if res.is_err() {
-            res.unwrap();
-        }
-    }
-
-    // let (input, title) = take_line(bytes).unwrap();
-    // let (input, meta) = take_line(&input[1..]).unwrap();
-    // let (input, comment_line) = take_line(&input[1..]).unwrap();
-
-    // let (input, counts_mem) = take_line(&input[1..]).unwrap();
-
-    // let counts: &Counts = unsafe { &*(counts_mem.as_ptr() as *mut Counts) };
-
-    // dbg!(std::str::from_utf8(&counts.num_atoms));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn it_parses_samples_without_panicing() {
+        let bytes = include_bytes!("../assets/sample.sdf");
+        let (rest, records) = parse_records(bytes).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(rest.len(), 0);
+    }
+
+    #[test]
     fn it_parses_property_line() {
-        let output = parse_property_line(b"M  CHG  2   2  -1   5   1").unwrap();
-        dbg!(output);
+        let (_, output) = parse_property_line(b"M  CHG  2   2  -1   5   1").unwrap();
+        assert_eq!(
+            output,
+            Property {
+                property: "M  CHG",
+                num_values: 2,
+                values: vec![(2, -1), (5, 1)]
+            }
+        );
+
+        let (_, output) = parse_property_line(
+            b"M  ISO  8  17   2  18   2  19   2  20   2  21   2  22   2  23   2  24   2",
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            Property {
+                property: "M  ISO",
+                num_values: 8,
+                values: vec![
+                    (17, 2),
+                    (18, 2),
+                    (19, 2),
+                    (20, 2),
+                    (21, 2),
+                    (22, 2),
+                    (23, 2),
+                    (24, 2)
+                ],
+            }
+        );
+
+        let (_, output) = parse_property_line(b"M  RAD  3  24   2  25   2  26   2").unwrap();
+
+        assert_eq!(
+            output,
+            Property {
+                property: "M  RAD",
+                num_values: 3,
+                values: vec![(24, 2), (25, 2), (26, 2),],
+            }
+        );
+    }
+
+    #[test]
+    fn it_parses_property_block() {
+        let bytes = b"M  CHG  1   4   1\n\
+        M  CHG  1   4   1\n\
+        M  CHG  1   4   1\n\
+        M  END\n";
+
+        let output = parse_property_block(bytes);
+        assert!(output.is_ok());
+        let (_, output) = output.unwrap();
+        assert_eq!(output.0.len(), 3);
+    }
+
+    #[test]
+    fn it_parses_empty_property_block() {
+        let bytes = b"M  END\n";
+
+        let output = parse_property_block(bytes);
+        assert!(output.is_ok());
+        let (_, output) = output.unwrap();
+        assert_eq!(output.0.len(), 0);
+    }
+
+    #[test]
+    fn it_parses_data_item_names() {
+        let (_, output) = parse_data_item_name(b"> <PUBCHEM_COMPOUND_CANONICALIZED>").unwrap();
+        assert_eq!(output, "PUBCHEM_COMPOUND_CANONICALIZED");
+    }
+
+    #[test]
+    fn it_pases_single_data_item() {
+        let bytes = b"> <PUBCHEM_IUPAC_OPENEYE_NAME>\n3-acetoxy-4-(trimethylammonio)butanoate\n\n";
+
+        let (_, (name, values)) = parse_data_item(bytes).unwrap();
+
+        assert_eq!(values.len(), 1);
+        assert_eq!(name, "PUBCHEM_IUPAC_OPENEYE_NAME");
+        assert_eq!(values[0], "3-acetoxy-4-(trimethylammonio)butanoate");
+    }
+
+    #[test]
+    fn it_pases_data_items_block() {
+        let bytes = b"> <PUBCHEM_COMPOUND_CID>\n1\n\n> <PUBCHEM_IUPAC_OPENEYE_NAME>\n3-acetoxy-4-(trimethylammonio)butanoate\n\n";
+
+        let (_, items) = parse_data_items_block(bytes).unwrap();
+
+        assert_eq!(items.len(), 2);
+
+        assert_eq!(items[0].0, "PUBCHEM_COMPOUND_CID");
+        assert_eq!(items[0].1[0], "1");
+
+        assert_eq!(items[1].0, "PUBCHEM_IUPAC_OPENEYE_NAME");
+        assert_eq!(items[1].1[0], "3-acetoxy-4-(trimethylammonio)butanoate");
     }
 }
